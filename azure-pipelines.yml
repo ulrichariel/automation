@@ -1,0 +1,219 @@
+# Azure Pipelines YAML for a GitHub-hosted repository.
+#
+# Design notes:
+# - PRs validate only. They do not build deployable artifacts or run deployments.
+# - Merge to main produces a single immutable image and promotes that same image forward.
+# - Validate and Build use Microsoft-hosted agents.
+# - Dev, QA, and Prod deployments use a self-hosted agent pool so deployed containers persist.
+# - QA and Prod are expected to use Azure DevOps Environment approvals/checks.
+# - In a public GitHub repo, secrets should remain unavailable to fork PR validation builds.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  nodeVersion: '20.x'
+  vmImageName: 'ubuntu-latest'
+  deployPoolName: 'LocalDockerPool'
+  imageName: 'nest-hello-release-demo'
+  imageTag: '$(Build.BuildId)'
+  artifactName: 'docker-image'
+  metadataArtifactName: 'release-metadata'
+  securityArtifactName: 'security-reports'
+  artifactFileName: '$(imageName)-$(imageTag).tar'
+  devContainerName: 'nest-hello-release-demo-dev'
+  qaContainerName: 'nest-hello-release-demo-qa'
+  prodContainerName: 'nest-hello-release-demo-prod'
+
+stages:
+  - stage: Validate
+    displayName: 'Validate source and application'
+    jobs:
+      - job: TestAndScan
+        displayName: 'Install, test, build, and scan source'
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(nodeVersion)'
+            displayName: 'Use Node.js $(nodeVersion)'
+
+          - script: npm ci
+            displayName: 'Install dependencies deterministically'
+
+          - script: npm test
+            displayName: 'Run unit tests'
+
+          - script: npm run build
+            displayName: 'Compile NestJS application'
+
+          - bash: |
+              set -euo pipefail
+              mkdir -p .tools
+              GITLEAKS_VERSION="8.18.4"
+              curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o .tools/gitleaks.tar.gz
+              tar -xzf .tools/gitleaks.tar.gz -C .tools
+              ./.tools/gitleaks detect --source . --config .gitleaks.toml --redact --verbose
+            displayName: 'Run Gitleaks secret scan'
+
+          - bash: |
+              set -euo pipefail
+              # Produce a machine-readable report while still blocking the pipeline on critical issues.
+              npm audit --omit=dev --json > $(Build.ArtifactStagingDirectory)/npm-audit.json || true
+              npm audit --omit=dev --audit-level=critical
+            displayName: 'Run dependency vulnerability audit and enforce critical threshold'
+
+  - stage: Build_Image
+    displayName: 'Build, scan, and package release artifact'
+    dependsOn: Validate
+    # Only trusted, post-merge mainline executions produce deployable artifacts.
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: BuildDockerImage
+        displayName: 'Build Docker image, scan it, and publish artifacts'
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - bash: |
+              set -euo pipefail
+              docker build \
+                --pull \
+                --build-arg BUILD_ID=$(Build.BuildId) \
+                --build-arg SOURCE_COMMIT=$(Build.SourceVersion) \
+                -t $(imageName):$(imageTag) .
+              docker save $(imageName):$(imageTag) -o $(Build.ArtifactStagingDirectory)/$(artifactFileName)
+            displayName: 'Build Docker image'
+
+          - bash: |
+              set -euo pipefail
+              mkdir -p .tools
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b .tools
+              # Keep the JSON report for review and fail only on critical findings.
+              ./.tools/trivy image --format json --output $(Build.ArtifactStagingDirectory)/trivy-report.json --severity HIGH,CRITICAL --ignore-unfixed $(imageName):$(imageTag)
+              ./.tools/trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed $(imageName):$(imageTag)
+            displayName: 'Run Trivy image vulnerability scan'
+
+          - bash: |
+              set -euo pipefail
+              cat > $(Build.ArtifactStagingDirectory)/release-metadata.json <<EOF2
+              {
+                "application": "$(imageName)",
+                "buildId": "$(Build.BuildId)",
+                "branch": "$(Build.SourceBranch)",
+                "commit": "$(Build.SourceVersion)",
+                "image": "$(imageName):$(imageTag)"
+              }
+              EOF2
+            displayName: 'Generate release metadata'
+
+          - publish: '$(Build.ArtifactStagingDirectory)/$(artifactFileName)'
+            artifact: '$(artifactName)'
+            displayName: 'Publish Docker image artifact'
+
+          - publish: '$(Build.ArtifactStagingDirectory)/release-metadata.json'
+            artifact: '$(metadataArtifactName)'
+            displayName: 'Publish release metadata artifact'
+
+          - publish: '$(Build.ArtifactStagingDirectory)'
+            artifact: '$(securityArtifactName)'
+            displayName: 'Publish security and release artifacts'
+
+  - stage: Deploy_Dev
+    displayName: 'Deploy to Dev'
+    dependsOn: Build_Image
+    condition: succeeded()
+    jobs:
+      - deployment: DeployDev
+        displayName: 'Deploy release artifact to dev'
+        pool:
+          name: $(deployPoolName)
+        environment: 'dev'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: 'Checkout repository'
+
+                - download: current
+                  artifact: '$(artifactName)'
+                  displayName: 'Download Docker image artifact'
+
+                - download: current
+                  artifact: '$(metadataArtifactName)'
+                  displayName: 'Download release metadata artifact'
+
+                - bash: |
+                    set -euo pipefail
+                    WORKSPACE=$(wslpath "$(Pipeline.Workspace)")
+                    docker load --input "${WORKSPACE}/$(artifactName)/$(artifactFileName)"
+                    sed -i 's/\r//' scripts/deploy.sh scripts/smoke-test.sh
+                    chmod +x scripts/deploy.sh scripts/smoke-test.sh
+                    ./scripts/deploy.sh dev $(imageName):$(imageTag) deploy/dev.env $(devContainerName) 3000
+                    ./scripts/smoke-test.sh http://localhost:3000/health/ready dev $(imageTag) ready
+                  displayName: 'Deploy and smoke test in dev'
+
+  - stage: Deploy_QA
+    displayName: 'Deploy to QA'
+    dependsOn: Deploy_Dev
+    condition: succeeded()
+    jobs:
+      - deployment: DeployQa
+        displayName: 'Promote the same release artifact to QA'
+        pool:
+          name: $(deployPoolName)
+        # Configure approvals/checks on the Azure DevOps environment itself.
+        environment: 'qa'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: '$(artifactName)'
+                  displayName: 'Download promoted Docker image artifact'
+
+                - bash: |
+                    set -euo pipefail
+                    WORKSPACE=$(wslpath "$(Pipeline.Workspace)")
+                    docker load --input "${WORKSPACE}/$(artifactName)/$(artifactFileName)"
+                    sed -i 's/\r//' scripts/deploy.sh scripts/smoke-test.sh
+                    chmod +x scripts/deploy.sh scripts/smoke-test.sh
+                    ./scripts/deploy.sh qa $(imageName):$(imageTag) deploy/qa.env $(qaContainerName) 3001
+                    ./scripts/smoke-test.sh http://localhost:3001/health/ready qa $(imageTag) ready
+                  displayName: 'Deploy and smoke test in QA'
+
+  - stage: Deploy_Prod
+    displayName: 'Deploy to Production'
+    dependsOn: Deploy_QA
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Promote the approved release artifact to production'
+        pool:
+          name: $(deployPoolName)
+        # Configure stricter approvals/checks on prod than on QA.
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: '$(artifactName)'
+                  displayName: 'Download approved Docker image artifact'
+
+                - bash: |
+                    set -euo pipefail
+                    WORKSPACE=$(wslpath "$(Pipeline.Workspace)")
+                    docker load --input "${WORKSPACE}/$(artifactName)/$(artifactFileName)"
+                    chmod +x scripts/deploy.sh scripts/smoke-test.sh
+                    ./scripts/deploy.sh prod $(imageName):$(imageTag) deploy/prod.env $(prodContainerName) 3002
+                    ./scripts/smoke-test.sh http://localhost:3002/health/ready prod $(imageTag) ready
+                  displayName: 'Deploy and smoke test in production'

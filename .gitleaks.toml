@@ -1,0 +1,11 @@
+title = "Assignment 2 Gitleaks config"
+
+[allowlist]
+description = "Allow known non-secret placeholders used in documentation and env files"
+paths = [
+  '''deploy/dev.env''',
+  '''deploy/qa.env'''
+]
+regexes = [
+  '''changeme'''
+]
