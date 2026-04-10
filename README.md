@@ -244,3 +244,6 @@ If this were expanded into a mature production implementation, I would add:
 - progressive deployment strategies such as blue/green or canary
 - stronger release metadata, automated release notes, and CAB evidence generation
 - rollback automation and post-release review workflow
+- a non-root container user (appuser with dropped privileges)
+- Dockerfile build determinism
+- CI/deploy workflow separation
